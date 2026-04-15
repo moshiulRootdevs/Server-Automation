@@ -50,6 +50,7 @@ MONGO_REPO_LINE='deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-se
 # INTERNALS (DON'T EDIT)
 # ==============================
 SERVER_IP="$(hostname -I | awk '{print $1}')"
+# shellcheck disable=SC2034
 REPL_HOST="${ADVERTISED_HOST:-$SERVER_IP}"
 
 DATA1="/data/mongo1"
@@ -136,9 +137,30 @@ wait_for_primary_auth() {
   exit 1
 }
 
-# Write mongod config (keyFile only — authorization enabled implicitly by MongoDB
-# when keyFile is present; localhost exception allows first-user creation)
-write_conf() {
+# Phase 1 config: NO security section.
+# MongoDB's localhost exception only works when there is no security config at all.
+# keyFile (even alone) implicitly enables authorization in MongoDB 8, blocking the exception.
+write_conf_noauth() {
+  local conf="$1" dbpath="$2" logfile="$3" port="$4"
+  sudo tee "$conf" >/dev/null <<EOF
+storage:
+  dbPath: $dbpath
+systemLog:
+  destination: file
+  path: $logfile
+  logAppend: true
+net:
+  port: $port
+  bindIp: 127.0.0.1
+replication:
+  replSetName: $REPLICA_NAME
+processManagement:
+  fork: false
+EOF
+}
+
+# Phase 2 config: full security — keyFile for RS internal auth + authorization for clients.
+write_conf_secure() {
   local conf="$1" dbpath="$2" logfile="$3" port="$4"
   sudo tee "$conf" >/dev/null <<EOF
 storage:
@@ -154,18 +176,10 @@ replication:
   replSetName: $REPLICA_NAME
 security:
   keyFile: $KEYFILE
+  authorization: enabled
 processManagement:
   fork: false
 EOF
-}
-
-# Add explicit authorization: enabled to a config (idempotent)
-enable_auth_in_conf() {
-  local conf="$1"
-  # Only add if not already present
-  if ! sudo grep -q "authorization: enabled" "$conf"; then
-    sudo sed -i '/^security:/a\  authorization: enabled' "$conf"
-  fi
 }
 
 # Create a systemd service for a mongod instance
@@ -218,7 +232,8 @@ sudo mkdir -p "$LOGDIR1" "$LOGDIR2" "$LOGDIR3"
 sudo chown -R mongodb:mongodb "$DATA1" "$DATA2" "$DATA3" \
   "$LOGDIR1" "$LOGDIR2" "$LOGDIR3"
 
-log "[4/10] Creating keyfile for internal replica set auth"
+# Keyfile is prepared now but only injected into configs in Phase 2.
+log "[4/10] Preparing keyfile (used in Phase 2 after user creation)"
 if [[ ! -f "$KEYFILE" ]]; then
   sudo openssl rand -base64 756 | sudo tee "$KEYFILE" >/dev/null
   sudo chmod 400 "$KEYFILE"
@@ -226,12 +241,13 @@ if [[ ! -f "$KEYFILE" ]]; then
 fi
 
 # ==============================
-# 3) WRITE CONFIGS
+# 3) PHASE 1 CONFIGS — no security section
+#    Localhost exception requires zero security config in MongoDB 8.
 # ==============================
-log "[5/10] Writing mongod configs (auth enabled via keyFile)"
-write_conf "$CONF1" "$DATA1" "$LOG1" "$PORT1"
-write_conf "$CONF2" "$DATA2" "$LOG2" "$PORT2"
-write_conf "$CONF3" "$DATA3" "$LOG3" "$PORT3"
+log "[5/10] Writing Phase 1 configs (no security — enables localhost exception)"
+write_conf_noauth "$CONF1" "$DATA1" "$LOG1" "$PORT1"
+write_conf_noauth "$CONF2" "$DATA2" "$LOG2" "$PORT2"
+write_conf_noauth "$CONF3" "$DATA3" "$LOG3" "$PORT3"
 
 # ==============================
 # 4) SYSTEMD SERVICES
@@ -291,15 +307,12 @@ try {
 wait_for_primary_noauth
 
 # ==============================
-# 7) CREATE ADMIN USER
+# 7) CREATE ADMIN USER (localhost exception — no security config in Phase 1)
 # ==============================
-log "[9/10] Creating admin user if missing (localhost exception)"
-# keyFile enables auth but the localhost exception allows first-user creation
-# when connecting from 127.0.0.1 and no users exist in admin yet.
+log "[9/10] Creating admin user (localhost exception is active)"
 mongosh --quiet --host 127.0.0.1 --port "$PORT1" --eval "
 var adminDb = db.getSiblingDB('admin');
 var existing = adminDb.getUser('$MONGO_USER');
-
 if (existing) {
   print('User already exists: $MONGO_USER');
 } else {
@@ -312,23 +325,24 @@ if (existing) {
 }
 "
 
-# Safety check: refuse to restart with auth if user doesn't exist
-log "Verifying admin user exists before enforcing authorization..."
+# Safety check: verify user was created before switching to secured config
+log "Verifying admin user exists before enabling authorization..."
 USER_CHECK="$(mongosh --quiet --host 127.0.0.1 --port "$PORT1" \
-  --eval "print(!!db.getSiblingDB('admin').getUser('$MONGO_USER'))" 2>/dev/null || echo "false")"
+  --eval "print(!!db.getSiblingDB('admin').getUser('$MONGO_USER'))" 2>/dev/null \
+  | tail -1)"
 if [[ "$USER_CHECK" != "true" ]]; then
   echo "ERROR: Admin user was not created. Refusing to enable authorization."
-  echo "Check mongod logs: sudo journalctl -u mongod1 -n 50"
+  echo "Check logs: sudo journalctl -u mongod1 -n 50"
   exit 1
 fi
 
 # ==============================
-# 8) ENABLE EXPLICIT AUTHORIZATION + RESTART
+# 8) PHASE 2 CONFIGS — keyFile + authorization, then restart
 # ==============================
-log "[10/10] Enabling explicit authorization in configs + restarting"
-enable_auth_in_conf "$CONF1"
-enable_auth_in_conf "$CONF2"
-enable_auth_in_conf "$CONF3"
+log "[10/10] Writing Phase 2 configs (keyFile + authorization) + restarting"
+write_conf_secure "$CONF1" "$DATA1" "$LOG1" "$PORT1"
+write_conf_secure "$CONF2" "$DATA2" "$LOG2" "$PORT2"
+write_conf_secure "$CONF3" "$DATA3" "$LOG3" "$PORT3"
 
 sudo systemctl restart mongod1 mongod2 mongod3
 
