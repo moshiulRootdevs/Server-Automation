@@ -34,9 +34,10 @@ PORT3=27020
 BIND_IP="0.0.0.0"
 
 # Address replica set members advertise to clients.
-# MUST be reachable from your application servers.
-# Use your server's public IP or a DNS name.
-ADVERTISED_HOST="$(hostname -I | awk '{print $1}')"
+# MUST be the PUBLIC IP or DNS name reachable from your app servers.
+# hostname -I returns the PRIVATE IP — override this with your public IP!
+# Example: ADVERTISED_HOST="67.220.95.211"
+ADVERTISED_HOST="$(curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
 
 # Optional: restrict firewall to a specific IP (recommended).
 # Leave empty "" to allow from anywhere.

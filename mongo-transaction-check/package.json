@@ -1,0 +1,12 @@
+{
+  "name": "mongo-transaction-check",
+  "version": "1.0.0",
+  "description": "Verifies MongoDB replica set transactions work correctly via Mongoose",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "mongoose": "^8.0.0"
+  }
+}
