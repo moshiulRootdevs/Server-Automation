@@ -292,6 +292,11 @@ try {
   var s = rs.status();
   print('Replica set already initialized: ' + s.set);
 } catch (e) {
+  // Code 94 = NotYetInitialized — the only case where rs.initiate() makes sense.
+  // Any other error (auth, network, already initialized, etc.) should surface.
+  if (e.code !== 94 && e.codeName !== 'NotYetInitialized') {
+    throw new Error('rs.status() failed unexpectedly: [' + e.codeName + '] ' + e.message);
+  }
   print('Initiating replica set...');
   rs.initiate({
     _id: '$REPLICA_NAME',
